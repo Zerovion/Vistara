@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>VISTRA - UGV Navigation Simulation MVP</title>
+<style>
+:root{--bg:#f3f3f3;--fg:#111;--mut:#666;--card:#fff;--bd:#d0d0d0;--acc:#0a6cff;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0d0d0d;--fg:#eee;--mut:#999;--card:#181818;--bd:#333;--acc:#4aa3ff}}
+:root[data-theme=dark]{--bg:#0d0d0d;--fg:#eee;--mut:#999;--card:#181818;--bd:#333;--acc:#4aa3ff}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+#top{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px;border-bottom:1px solid var(--bd);background:var(--card)}
+#top b{font-size:16px;letter-spacing:.08em}.badge{font-size:11px;border:1px solid var(--acc);color:var(--acc);padding:2px 6px;border-radius:10px}
+button,select,input{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:4px 8px}
+button{cursor:pointer}button.on{background:var(--acc);color:#fff;border-color:var(--acc)}input{width:64px}
+main{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);gap:8px;padding:8px}
+section{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:8px;min-width:0}
+h3{margin:0 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--mut)}
+canvas{width:100%;height:auto;display:block;background:#000;border-radius:4px}
+.r{display:flex;align-items:center;gap:6px;margin:3px 0}.r span{width:90px;color:var(--mut)}.r i{flex:1;height:8px;background:var(--bd);border-radius:4px;overflow:hidden}.r b{display:block;height:100%;background:var(--acc)}.r em{width:34px;text-align:right;font-style:normal}
+#st{display:inline-block;padding:2px 10px;border-radius:10px;color:#000;font-weight:700;margin-bottom:4px}
+#kv{margin-top:6px;font-variant-numeric:tabular-nums}
+#log{height:190px;overflow:auto;font:12px ui-monospace,Menlo,monospace}#log div{padding:2px 0;border-bottom:1px solid var(--bd)}
+.wide{grid-column:1/-1}.fb{display:flex;flex-wrap:wrap;gap:6px}
+table{border-collapse:collapse;width:100%}td,th{border:1px solid var(--bd);padding:4px 6px;text-align:left}
+.sc{overflow-x:auto}
+@media(max-width:800px){main{grid-template-columns:1fr}}
+</style></head><body>
+<div id="top"><b>VISTRA</b><span class="badge">Simulation MVP v0 - perception is simulated, not a trained model</span>
+<select id="sc"><option value="0">Open terrain</option><option value="1">Rocks + ditch</option><option value="2">Narrow path</option></select>
+Seed <input id="seed" type="number" value="7">
+<button id="go">Pause</button><button id="rs">Reset</button>
+<button class="sp on" data-s="1">x1</button><button class="sp" data-s="2">x2</button><button class="sp" data-s="4">x4</button>
+<select id="mode"><option value="V">Mode: VISTRA</option><option value="B">Mode: Baseline</option></select></div>
+<main>
+<section><h3>BEV map (risk overlay) - white: true path, blue: estimated path, green dashed: plan</h3><canvas id="bev" width="640" height="480"></canvas></section>
+<section><h3>Simulated camera</h3><canvas id="cam" width="320" height="180"></canvas>
+<label><input type="checkbox" id="seg"> Show simulated segmentation (illustrative colors, errors grow with fault level)</label>
+<div style="margin-top:8px"><span id="st">NORMAL</span><div id="g"></div><div id="kv"></div></div></section>
+<section><h3>Fault injection</h3><div class="fb"><button data-f="obs">Spawn obstacle ahead</button><button data-f="dark">Darken camera</button><button data-f="blur">Blur camera</button><button data-f="cover">Cover camera</button><button data-f="clear">Clear faults</button></div>
+<p style="color:var(--mut);margin:8px 0 0">Ditch cells are simulated as hard to classify (often confused with grass), as in the blueprint. Faults change simulated noise, feature count, NCS and behavior. Clicks make a run non-reproducible; the seed alone is.</p></section>
+<section><h3>Explanation feed (state transitions only)</h3><div id="log"></div></section>
+<section class="wide"><h3>Comparison</h3><button id="both">Run both (same seed)</button> <span style="color:var(--mut)">headless, scripted faults at t=15 obstacle, 25-35 dark, 42-50 blur; one seeded run per system, not statistics</span>
+<div class="sc"><div id="cmp"></div></div></section>
+</main>
+<script>
+"use strict";
+const W=80,H=60,CS=.5,N=W*H,T_=[1,.7,.6,.2,0,0,0],COL=['#b08d57','#4d7c3a','#8a8a8a','#2f5d2a','#666','#2a1c10','#1c4a1c'];
+const m32=a=>()=>{a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296};
+const gauss=r=>Math.sqrt(-2*Math.log(r()+1e-9))*Math.cos(6.2832*r()),clamp=(v,a=0,b=1)=>Math.min(b,Math.max(a,v)),ang=a=>Math.atan2(Math.sin(a),Math.cos(a));
+const ci=(x,y)=>{const cx=Math.floor(x/CS),cy=Math.floor(y/CS);return cx<0||cy<0||cx>=W||cy>=H?-1:cy*W+cx};
+const hu=(a,b,c,e)=>{let h=Math.imul(a+1013,73856093)^Math.imul(b+7919,19349663)^Math.imul(c+31,83492791)^Math.imul(e+5,2654435761);h=Math.imul(h^h>>>15,2246822507);h=Math.imul(h^h>>>13,3266489909);return((h^h>>>16)>>>0)/4294967296},hg=(e,a,b,c)=>Math.sqrt(-2*Math.log(hu(a,b,c,e)+1e-9))*Math.cos(6.2832*hu(a,b,c,e+99));
+const log=(s,m)=>s.log.push(`t=${s.t.toFixed(1)}s ${m}`);
+function mkWorld(sc,seed){
+ const r=m32(seed*7919+sc*104729+1),g=new Uint8Array(N).fill(1),ph=r()*6,ty=x=>Math.round(30+5*Math.sin(x/10+ph));
+ const set=(x,y,c)=>{if(x>=0&&y>=0&&x<W&&y<H)g[y*W+x]=c};
+ const blob=(cx,cy,rr,c)=>{for(let y=0;y<H;y++)for(let x=0;x<W;x++)if((x-cx)**2+(y-cy)**2<rr*rr)g[y*W+x]=c};
+ for(let i=0;i<12;i++)blob(r()*W,r()*H,2+r()*4,2);
+ blob(25+r()*30,r()<.5?10:50,5,3);
+ for(let x=0;x<W;x++)for(let d=-1;d<=1;d++)set(x,ty(x)+d,0);
+ const rock=(x,y)=>{set(x,y,4);set(x+1,y,4);set(x,y+1,4);set(x+1,y+1,4)};
+ for(let i=0,n=[22,26,30][sc];i<n;i++){const x=8+Math.floor(r()*64),y=Math.floor(r()*H),k=r()<.6;if(Math.abs(y-ty(x))<=2)continue;k?rock(x,y):set(x,y,6)}
+ if(sc==1){for(let i=0;i<5;i++){const x=Math.floor(r()<.5?10+r()*24:46+r()*24);rock(x,ty(x))}
+  for(let x=38;x<=41;x++)for(let y=0;y<H;y++)if(Math.abs(y-ty(x))>2)set(x,y,5)}
+ if(sc==2)for(let x=24;x<=56;x++){set(x,ty(x)-2,r()<.5?4:6);set(x,ty(x)+2,r()<.5?4:6)}
+ return{g,A:[3*CS,(ty(3)+.5)*CS],B:[77.5*CS,(ty(77)+.5)*CS]}}
+const dyn=(s,t)=>{if(s.sc!=1)return null;const p=(.6*t+10)%44;return{x:28.25,y:4+(p<22?p:44-p)}};
+function mkSim(sc,seed,mode,script){const w=mkWorld(sc,seed);return{w,sc,mode,script,sd:seed,lr:-9,bd:99,tb:0,rP:m32(seed+11),rV:m32(seed+23),t:0,k:0,x:w.A[0],y:w.A[1],th:0,v:0,om:0,ex:w.A[0],ey:w.A[1],eth:0,P:.01,
+ L:new Float32Array(N).fill(-.405),obs:new Uint8Array(N),bl:new Uint8Array(N),R:new Float32Array(N).fill(.4),R0:new Float32Array(N).fill(.4),
+ f:{dark:0,blur:0,cover:0},feat:150,pc:1,lc:1,pa:1,iq:1,ncs:1,lv:3,ttc:9,crs:0,sz:0,path:[],pi:0,tp:[],ep:[],cap:.8,cap0:.8,fl:150,vl:0,vr:0,replans:0,col:0,pl:0,minc:99,le:0,ln:0,estop:0,log:[],done:0,ok:0,inCol:0,lp:-99,wp:0,rq:0,np:0,rl:0,bs:0}}
+function fault(s,q){const f=s.f;
+ if(q=='obs'){const cx=Math.floor((s.x+Math.cos(s.th)*5)/CS),cy=Math.floor((s.y+Math.sin(s.th)*5)/CS);for(const[a,b]of[[0,0],[1,0],[0,1],[1,1]]){const X=cx+a,Y=cy+b;if(X>=0&&Y>=0&&X<W&&Y<H)s.w.g[Y*W+X]=4}log(s,'FAULT: obstacle spawned 5.0 m ahead of UGV.')}
+ else if(q=='dark'){f.dark=f.dark?Math.min(.95,f.dark+.2):.45;log(s,`FAULT: camera darkened (level ${f.dark.toFixed(2)}).`)}
+ else if(q=='blur'){f.blur=f.blur?Math.min(.95,f.blur+.2):.45;log(s,`FAULT: camera blurred (level ${f.blur.toFixed(2)}).`)}
+ else if(q=='cover'){f.cover=1;log(s,'FAULT: camera covered (total input loss).')}
+ else{f.dark=f.blur=f.cover=0;log(s,'Faults cleared.')}}
+function perceive(s){const f=s.f;if(f.cover>.5)return;const g=s.w.g,cx0=Math.floor(s.x/CS),cy0=Math.floor(s.y/CS),ox=Math.round((s.ex-s.x)/CS),oy=Math.round((s.ey-s.y)/CS),z=new Array(7);let sm=0,n=0;
+ for(let dy=-20;dy<=20;dy++)for(let dx=-20;dx<=20;dx++){const cx=cx0+dx,cy=cy0+dy;if(cx<0||cy<0||cx>=W||cy>=H)continue;
+  const px=(cx+.5)*CS-s.x,py=(cy+.5)*CS-s.y,d=Math.hypot(px,py);if(d>10||d<.4||Math.abs(ang(Math.atan2(py,px)-s.th))>.785)continue;
+  const tk=g[cy*W+cx],a=(7-.25*d)*(1-.7*f.dark-.5*f.blur),sg=(.02+.02*d+.3*f.dark+.3*f.blur)*3;let Z=0;
+  for(let k=0;k<7;k++){const lg=(k==tk?(tk==5?a*.5:a):0)+(tk==5&&k==1?a*.45:0)+gauss(s.rP)*sg*.6+hg(s.sd,cx>>1,cy>>1,(s.k>>2)*7+k)*sg*.8;z[k]=Math.exp(lg);Z+=z[k]}
+  let T=0,U=0,mx=0,am=0;for(let k=0;k<7;k++){const p=z[k]/Z;T+=p*T_[k];if(p>1e-9)U-=p*Math.log(p);if(p>mx){mx=p;am=k}}U/=Math.log(7);
+  const X=cx+ox,Y=cy+oy;if(X<0||Y<0||X>=W||Y>=H)continue;const i=Y*W+X;
+  s.obs[i]=1;s.bl[i]=am>=4?1:0;const r=clamp((1-T)+.4*U,.05,.95);s.L[i]+=.3*(Math.log(r/(1-r))-s.L[i]);
+  if(d<6){sm+=mx;n++}}
+ if(n)s.pc=clamp((sm/n-.35)/.45)}
+function updRisk(s){const R=s.R,R0=s.R0,V=s.mode=='V',sd=Math.min(.5,Math.sqrt(s.P));
+ for(let i=0;i<N;i++){if(V){s.L[i]+=(-.405-s.L[i])*.003;R0[i]=1/(1+Math.exp(-s.L[i]));R[i]=Math.min(1,R0[i]*(1+sd))}else{R0[i]=s.bl[i]?1:0;R[i]=s.bl[i]?1:s.obs[i]?0:.4}}
+ for(let y=0;y<H;y++)for(let x=0;x<W;x++)if(R0[y*W+x]>=.75)for(let a=-2;a<=2;a++)for(let b=-2;b<=2;b++){const X=x+a,Y=y+b,d=Math.max(Math.abs(a),Math.abs(b));if(!d||X<0||Y<0||X>=W||Y>=H||(!V&&d>1))continue;const j=Y*W+X;R[j]=Math.min(1,d==1?Math.max(R[j],.8):R[j]+.15)}}
+function plan(s){const V=s.mode=='V',R=s.R,bl=s.bl,st=ci(s.ex,s.ey),gl=ci(s.w.B[0],s.w.B[1]);if(st<0){s.path=[];return}
+ const g=new Float32Array(N).fill(1e9),par=new Int32Array(N).fill(-1),cl=new Uint8Array(N),hp=[];
+ const push=(f,i)=>{hp.push([f,i]);let k=hp.length-1;while(k>0){const p=(k-1)>>1;if(hp[p][0]<=hp[k][0])break;[hp[p],hp[k]]=[hp[k],hp[p]];k=p}};
+ const pop=()=>{const t=hp[0],l=hp.pop();if(hp.length){hp[0]=l;let k=0;for(;;){const a=2*k+1,b=a+1;let m=k;if(a<hp.length&&hp[a][0]<hp[m][0])m=a;if(b<hp.length&&hp[b][0]<hp[m][0])m=b;if(m==k)break;[hp[m],hp[k]]=[hp[k],hp[m]];k=m}}return t};
+ const gx=gl%W,gy=(gl/W)|0,hf=i=>{const dx=Math.abs(i%W-gx),dy=Math.abs((i/W|0)-gy);return Math.max(dx,dy)+.414*Math.min(dx,dy)};
+ g[st]=0;push(hf(st),st);
+ while(hp.length){const i=pop()[1];if(cl[i])continue;cl[i]=1;if(i==gl)break;const x=i%W,y=i/W|0;
+  for(let a=-1;a<=1;a++)for(let b=-1;b<=1;b++){if(!a&&!b)continue;const X=x+a,Y=y+b;if(X<0||Y<0||X>=W||Y>=H)continue;const j=Y*W+X;if(cl[j])continue;
+   if(j!=gl&&R[j]>=.75)continue;const c=g[i]+(a&&b?1.414:1)*(V?1+8*R[j]:1);if(c<g[j]){g[j]=c;par[j]=i;push(c+hf(j),j)}}}
+ if(par[gl]<0&&gl!=st){s.path=[];return}
+ const p=[];for(let i=gl;i>=0;i=par[i])p.push([(i%W+.5)*CS,((i/W|0)+.5)*CS]);s.path=p.reverse();s.pi=0}
+function roll(s,v,w){let x=s.ex,y=s.ey,th=s.eth,sm=0,hit=0,ttc=9;
+ for(let i=1;i<=30;i++){th+=w*.1;x+=v*Math.cos(th)*.1;y+=v*Math.sin(th)*.1;const c=ci(x,y);if(c>=0)sm+=s.R[c];
+  if(!hit&&v*i*.1>=.5){let h=0;for(const[a,b]of[[0,0],[.4,0],[-.4,0],[0,.4],[0,-.4]]){const q=ci(x+a,y+b);if(q>=0&&s.R[q]>=.5)h=1}
+   const d=dyn(s,s.t+i*.1);if(d&&Math.hypot(d.x-x,d.y-y)<1)h=1;if(h){hit=1;ttc=i*.1}}}
+ return{ttc,mr:sm/30}}
+function dwa(s,cap,tg){let best=[0,.6],bc=1e9;
+ for(const v of[0,.2,.4,.6,.8]){if(v>cap+1e-9)continue;for(const w of[-1,-.6,-.3,0,.3,.6,1]){
+  let x=s.ex,y=s.ey,th=s.eth,rs=0,bad=0,mn=9,nh=0;
+  for(let i=1;i<=10;i++){th+=w*.2;x+=v*Math.cos(th)*.2;y+=v*Math.sin(th)*.2;const c=ci(x,y);if(c<0){bad=1;break}const r=s.R[c];if(r>=.75&&v>0){bad=1;break}rs+=r;if(r>=.5)nh++;
+   if(i%2==0){const cx=c%W,cy=c/W|0;for(let a=-2;a<=2;a++)for(let b=-2;b<=2;b++){const X=cx+a,Y=cy+b;if(X>=0&&Y>=0&&X<W&&Y<H&&s.R[Y*W+X]>=.75)mn=Math.min(mn,Math.hypot(a,b)*CS)}}}
+  if(bad)continue;
+  const cost=2*Math.hypot(x-tg[0],y-tg[1])+.8*Math.abs(ang(th-Math.atan2(tg[1]-y,tg[0]-x)))+.4*rs+.15*nh+(mn<.8?(.8-mn)*1.5:0)+(v==0?2.5:0)+.4*Math.abs(w-s.wp);
+  if(cost<bc){bc=cost;best=[v,w]}}}
+ s.wp=best[1];return best}
+function hitW(s,x,y){for(const[a,b]of[[0,0],[.4,0],[-.4,0],[0,.4],[0,-.4],[.28,.28],[-.28,.28],[.28,-.28],[-.28,-.28]]){const c=ci(x+a,y+b);if(c<0||s.w.g[c]>=4)return 1}return 0}
+function clearance(s){const cx0=Math.floor(s.x/CS),cy0=Math.floor(s.y/CS);let m=99;for(let dy=-8;dy<=8;dy++)for(let dx=-8;dx<=8;dx++){const X=cx0+dx,Y=cy0+dy;if(X>=0&&Y>=0&&X<W&&Y<H&&s.w.g[Y*W+X]>=4)m=Math.min(m,Math.hypot((X+.5)*CS-s.x,(Y+.5)*CS-s.y)-.25)}
+ const d=dyn(s,s.t);if(d)m=Math.min(m,Math.hypot(d.x-s.x,d.y-s.y)-.6);return m}
+const NM=['SAFE_STOP','RECOVER','CAUTION','NORMAL'];
+function step(s){const dt=.1,f=s.f,V=s.mode=='V';s.t+=dt;s.k++;
+ for(const e of s.script||[])if(!e.d&&s.t>=e.t){e.d=1;fault(s,e.a)}
+ const c0=s.w.g[ci(s.x,s.y)]??1;s.feat=Math.round(150*(1-.85*f.dark)*(1-.7*f.blur)*(1-f.cover)*[.8,1,.9,.7,.5,.5,.5][c0]);
+ s.iq=(1-.85*f.dark)*(1-.8*f.blur)*(1-f.cover);
+ if(s.k%2==0)perceive(s);
+ if(s.k%5==0){updRisk(s);
+  const blk=s.path.slice(s.pi,s.pi+20).some(p=>{const i=ci(p[0],p[1]);return s.R[i]>=.75});
+  if(!s.path.length||blk||s.rq||s.k-s.lp>=30){if((blk||s.rq)&&s.t-s.lr>=2){s.replans++;s.lr=s.t;log(s,`Replan triggered: ${s.rq||'path blocked by new obstacle in map'}.`)}s.rq=0;plan(s);s.lp=s.k;
+   if(!s.path.length){if(!s.np){s.np=1;log(s,'No path found: red cells block all routes.')}}else s.np=0}
+  if(s.path.length){const q=s.path.slice(s.pi,s.pi+20);s.pa=clamp(1-Math.max(0,q.reduce((a,p)=>a+s.R[ci(p[0],p[1])],0)/q.length-.2)*1.5)}else s.pa=.25}
+ s.lc=clamp(s.feat/110)*Math.exp(-Math.sqrt(s.P)/1.2);
+ const comps=[['perception',s.pc],['localization',s.lc],['path',s.pa],['input quality',s.iq]],raw=Math.min(...comps.map(c=>c[1]));s.ncs+=.25*(raw-s.ncs);
+ if(V){const th=[.2,.4,.7],t1=th.filter(q=>s.ncs>q).length,t2=th.filter(q=>s.ncs-.05>q).length;let nl=s.lv;if(t1<s.lv)nl=t1;else if(t2>s.lv)nl=t2;
+  s.cap=[0,.1,clamp(.3+.5*(s.ncs-.4)/.3,.3,.8),.8][nl];
+  if(nl!=s.lv){const wk=comps.reduce((a,b)=>b[1]<a[1]?b:a);
+   log(s,`${NM[nl]}: NCS ${s.ncs.toFixed(2)}, weakest: ${wk[0]} ${wk[1].toFixed(2)}${wk[0]=='localization'||wk[0]=='input quality'?` (features ${s.fl}->${s.feat})`:''}. Speed cap ${s.cap0.toFixed(1)}->${s.cap.toFixed(1)} m/s.`);
+   s.lv=nl;s.cap0=s.cap;s.fl=s.feat}}
+ const dg=Math.hypot(s.x-s.w.B[0],s.y-s.w.B[1]);if(dg<s.bd-.5||(V&&s.lv<3)){s.bd=Math.min(s.bd,dg);s.tb=s.t}
+ if(V&&s.t-s.tb>15&&s.estop<=0){s.tb=s.t;const c=ci(s.ex,s.ey);if(c>=0)for(let dy=-8;dy<=8;dy++)for(let dx=-8;dx<=8;dx++){const X=c%W+dx,Y=(c/W|0)+dy;if(X>=0&&Y>=0&&X<W&&Y<H)s.L[Y*W+X]=-.405}s.rq='no progress for 15 s, local map reset';log(s,'No progress for 15 s: resetting local 4 m map to re-observe.')}
+ let v=0,w=0,z=0;
+ if(V&&s.estop>0)s.estop-=dt;
+ else if(V&&s.lv<=1){w=s.lv==1?.3:0}
+ else if(s.path.length&&s.pi<s.path.length-1){
+  let bi=s.pi,bd=1e9;for(let i=s.pi;i<Math.min(s.path.length,s.pi+12);i++){const d=Math.hypot(s.path[i][0]-s.ex,s.path[i][1]-s.ey);if(d<bd){bd=d;bi=i}}s.pi=bi;
+  const tg=s.path[Math.min(s.path.length-1,bi+6)];
+  if(V){[v,w]=dwa(s,s.cap,tg)}
+  else{const e=ang(Math.atan2(tg[1]-s.ey,tg[0]-s.ex)-s.eth);w=clamp(2*e,-1,1);v=.8*Math.max(0,Math.cos(e))**2;
+   const a=ci(s.ex+Math.cos(s.eth)*1.2,s.ey+Math.sin(s.eth)*1.2),b=a>=0&&s.bl[a]?1:0;if(b){v=0}
+   if(b!=s.bs){s.bs=b;if(b){log(s,'Fixed-distance stop: obstacle within 1.2 m ahead.');s.rq='obstacle within fixed stop distance'}}}
+  if(V&&v>0){const tau=.2+s.v/1.2,r=roll(s,v,w),q=r.ttc/tau;s.ttc=r.ttc;s.crs=clamp(Math.max(tau/Math.min(r.ttc,3),r.mr));
+   z=r.ttc>=9||q>3?0:q>1.5?1:q>1?2:3;
+   if(z==1)v*=.3+.7*(q-1.5)/1.5;
+   if(z>=2)v=0
+   if(z!=s.sz){const m=`TTC ${r.ttc.toFixed(1)}s vs stopping time ${tau.toFixed(1)}s`;
+    if(z==1)log(s,`SLOW: ${m}. Speed scaled down.`);
+    if(z==2){log(s,`HARD BRAKE: ${m}.`);s.rq='hard brake, TTC below 1.5x stopping time'}
+    if(z==3){log(s,`EMERGENCY STOP: TTC ${r.ttc.toFixed(1)}s < stopping time ${tau.toFixed(1)}s.`);s.estop=1.5;s.rq='emergency stop'}
+    if(z==0&&s.sz>=2)log(s,'Safety layer: path clear, resuming.');s.sz=z}}
+  else if(V){s.ttc=9;s.crs=0;if(s.sz&&s.sz<3)s.sz=0}}
+ if(V&&s.lv<=1&&s.feat>=50){if(!s.rl&&s.P>=.03){s.rl=1;log(s,`Relocalizing: features ${s.feat}, covariance ${s.P.toFixed(3)}.`)}
+  s.P=Math.max(.01,s.P*Math.exp(-dt/2));s.ex+=(s.x-s.ex)*dt*.4;s.ey+=(s.y-s.ey)*dt*.4;s.eth+=ang(s.th-s.eth)*dt*.4}
+ if(s.rl&&s.P<.03){s.rl=0;log(s,`Relocalization complete: covariance ${s.P.toFixed(3)}.`)}
+ v*=[1,.85,.8,.5,.3,.3,.3][c0];const dv=v-s.v;s.v+=dv>0?Math.min(dv,.6*dt):Math.max(dv,-[1.2,1.2,2.5,4][z]*dt);s.om+=(w-s.om)*.5;
+ const nth=s.th+s.om*dt;let nx=s.x+s.v*Math.cos(nth)*dt,ny=s.y+s.v*Math.sin(nth)*dt;
+ let hit=hitW(s,nx,ny);const dd=dyn(s,s.t);if(dd&&Math.hypot(dd.x-nx,dd.y-ny)<1)hit=2;
+ if(hit){if(!s.inCol){s.col++;s.inCol=1;log(s,`COLLISION with ${hit==2?'moving obstacle':'terrain obstacle'}.`)}if(hit==1){s.v=0;nx=s.x;ny=s.y}}else s.inCol=0;
+ const d=Math.hypot(nx-s.x,ny-s.y),fq=s.feat/150,sg=d*(.03+.6*(1-fq)**1.5);
+ s.ex+=nx-s.x+gauss(s.rV)*sg;s.ey+=ny-s.y+gauss(s.rV)*sg;s.eth+=ang(nth-s.th)+gauss(s.rV)*sg*.3;s.P+=2*sg*sg+d*3e-4;
+ s.x=nx;s.y=ny;s.th=nth;s.pl+=d;s.le+=Math.hypot(s.ex-s.x,s.ey-s.y);s.ln++;
+ s.vl=s.v-s.om*.25;s.vr=s.v+s.om*.25;
+ if(s.k%5==0){s.minc=Math.min(s.minc,clearance(s));s.tp.push([s.x,s.y]);s.ep.push([s.ex,s.ey])}
+ if(Math.hypot(s.x-s.w.B[0],s.y-s.w.B[1])<1){s.done=1;s.ok=1;log(s,'Goal B reached.')}
+ else if(s.t>=300){s.done=1;log(s,'Timeout: goal not reached in 300 s.')}}
+const SCR=()=>[{t:15,a:'obs'},{t:25,a:'dark'},{t:35,a:'clear'},{t:42,a:'blur'},{t:50,a:'clear'}];
+function headless(sc,seed,m){const s=mkSim(sc,seed,m,SCR());for(let n=0;!s.done&&n<3100;n++)step(s);return{ok:s.ok,col:s.col,pl:s.pl,t:s.t,rp:s.replans,mc:s.minc,le:s.ln?s.le/s.ln:0}}
+//==UI==
+const $=id=>document.getElementById(id),G=[['NCS','ncs'],['Perception','pc'],['Localization','lc'],['Path','pa'],['Input quality','iq']];
+$('g').innerHTML=G.map(([n,k])=>`<div class="r"><span>${n}</span><i><b id="b_${k}"></b></i><em id="v_${k}"></em></div>`).join('');
+const mk=()=>mkSim(+$('sc').value,+$('seed').value||1,$('mode').value,null);
+let S=mk(),run=true,spd=1,last=performance.now(),acc=0,lgN=0,lastD=0;
+function reset(){S=mk();$('log').innerHTML='';lgN=0;run=true;$('go').textContent='Pause'}
+$('rs').onclick=reset;$('sc').onchange=reset;$('seed').onchange=reset;$('mode').onchange=reset;
+$('go').onclick=()=>{run=!run;$('go').textContent=run?'Pause':'Start'};
+document.querySelectorAll('.sp').forEach(b=>b.onclick=()=>{spd=+b.dataset.s;document.querySelectorAll('.sp').forEach(x=>x.classList.toggle('on',x==b))});
+document.querySelectorAll('[data-f]').forEach(b=>b.onclick=()=>{if(!S.done)fault(S,b.dataset.f)});
+$('both').onclick=()=>{$('cmp').textContent='Running both headless...';setTimeout(()=>{const sc=+$('sc').value,sd=+$('seed').value||1,a=headless(sc,sd,'V'),b=headless(sc,sd,'B');
+ const row=(n,f)=>`<tr><td>${n}</td><td>${f(a)}</td><td>${f(b)}</td></tr>`;
+ $('cmp').innerHTML=`<table><tr><th>Metric</th><th>VISTRA</th><th>Baseline</th></tr>${row('Success',r=>r.ok?'yes':'no')}${row('Collisions',r=>r.col)}${row('Path length (m)',r=>r.pl.toFixed(1))}${row('Time (s)',r=>r.t.toFixed(1))}${row('Replans',r=>r.rp)}${row('Min clearance (m)',r=>r.mc>50?'n/a':r.mc.toFixed(2))}${row('Mean loc. error (m)',r=>r.le.toFixed(2))}</table>`},30)};
+function bev(s){const c=$('bev'),x=c.getContext('2d'),k=8;x.fillStyle='#111';x.fillRect(0,0,640,480);
+ for(let i=0;i<N;i++){const X=(i%W)*k,Y=(i/W|0)*k;x.globalAlpha=.35;x.fillStyle=COL[s.w.g[i]];x.fillRect(X,Y,k,k);
+  const r=s.R[i];x.globalAlpha=s.obs[i]?.6:.15;x.fillStyle=r<.25?'#2ecc71':r<.5?'#f1c40f':r<.75?'#e67e22':'#e74c3c';x.fillRect(X,Y,k,k)}
+ x.globalAlpha=1;const m=CS*2*k/1,P=(p)=>[p[0]/CS*k,p[1]/CS*k];
+ const line=(a,col,dash)=>{if(a.length<2)return;x.beginPath();x.setLineDash(dash||[]);x.strokeStyle=col;x.lineWidth=2;a.forEach((p,i)=>{const q=P(p);i?x.lineTo(q[0],q[1]):x.moveTo(q[0],q[1])});x.stroke();x.setLineDash([])};
+ line(s.tp,'#fff');line(s.ep,'#4aa3ff');line(s.path.slice(s.pi),'#2ecc71',[5,4]);
+ const[ux,uy]=P([s.x,s.y]);x.fillStyle='rgba(74,163,255,.18)';x.beginPath();x.moveTo(ux,uy);x.arc(ux,uy,80,s.th-.785,s.th+.785);x.closePath();x.fill();
+ x.save();x.translate(ux,uy);x.rotate(s.th);x.fillStyle='#fff';x.beginPath();x.moveTo(9,0);x.lineTo(-6,-6);x.lineTo(-6,6);x.closePath();x.fill();x.restore();
+ const d=dyn(s,s.t);if(d){const q=P([d.x,d.y]);x.fillStyle='#ff2d55';x.beginPath();x.arc(q[0],q[1],5,0,7);x.fill()}
+ x.fillStyle='#fff';x.font='bold 13px sans-serif';const a=P(s.w.A),b=P(s.w.B);x.fillText('A',a[0]-4,a[1]-8);x.fillText('B',b[0]-4,b[1]-8)}
+function cam(s){const seg=$('seg').checked,SEG=['#d9b26f','#5cd65c','#b0b0b0','#1f7a1f','#ff4d4d','#3399ff','#ff9933'],c=$('cam'),x=c.getContext('2d'),Wd=320,Hd=180,hor=70,cols=80,cw=Wd/cols,f=s.f;x.save();x.filter=f.blur?`blur(${f.blur*5}px)`:'none';
+ x.fillStyle='#8ab8e6';x.fillRect(0,0,Wd,hor);x.fillStyle='#333';x.fillRect(0,hor,Wd,Hd-hor);
+ for(let i=0;i<cols;i++){const a=s.th+(i/(cols-1)-.5)*1.57;
+  for(let d=10;d>=.5;d-=.25){const q=ci(s.x+Math.cos(a)*d,s.y+Math.sin(a)*d);if(q<0)continue;const t=s.w.g[q],yy=hor+55/d;let tn=t;if(seg){const u=Math.abs(Math.sin(i*12.9898+d*78.233+s.k*.7)*43758.5453)%1;if(u<f.dark*.45+f.blur*.3+.02*d/10)tn=(t+1+Math.floor(u*1e3)%6)%7}
+   x.fillStyle=seg?SEG[tn]:COL[t>=4&&t!=5?1:t];x.fillRect(i*cw,yy,cw+1,Hd-yy);
+   if(t==4||t==6){const h=(t==6?110:45)/d;x.fillStyle=seg?SEG[tn]:t==6?'#0c3a0c':'#888';x.fillRect(i*cw,yy-h,cw+1,h)}}}
+ const dd=dyn(s,s.t);if(dd){const px=dd.x-s.x,py=dd.y-s.y,b=ang(Math.atan2(py,px)-s.th),d=Math.hypot(px,py);if(Math.abs(b)<.785&&d<10&&d>.5){const sx=(b/1.57+.5)*Wd,h=90/d;x.fillStyle='#ff2d55';x.fillRect(sx-h/4,hor+55/d-h,h/2,h)}}
+ x.restore();if(f.dark){x.fillStyle=`rgba(0,0,0,${f.dark*.85})`;x.fillRect(0,0,Wd,Hd)}
+ if(f.cover){x.fillStyle='#000';x.fillRect(0,0,Wd,Hd);x.fillStyle='#888';x.fillText('CAMERA COVERED',110,95)}}
+function ui(s){const V=s.mode=='V',n=V?(s.estop>0?'EMERGENCY_STOP':NM[s.lv]):'BASELINE (no gating)',cl={NORMAL:'#2ecc71',CAUTION:'#f1c40f',RECOVER:'#e67e22',SAFE_STOP:'#e74c3c',EMERGENCY_STOP:'#ff2d55'}[n]||'#999';
+ $('st').textContent=n;$('st').style.background=cl;
+ for(const[,k]of G){$('b_'+k).style.width=s[k]*100+'%';$('v_'+k).textContent=s[k].toFixed(2)}
+ $('kv').innerHTML=`speed ${s.v.toFixed(2)} m/s (cap ${V?s.cap.toFixed(2):'0.80'}) | w ${s.om.toFixed(2)} rad/s<br>vL ${s.vl.toFixed(2)} | vR ${s.vr.toFixed(2)} m/s<br>TTC ${V?(s.ttc>=9?'>3':s.ttc.toFixed(1))+' s':'n/a'} | collision risk ${V?s.crs.toFixed(2):'n/a'}<br>features ${s.feat} | loc err ${(s.ln?Math.hypot(s.ex-s.x,s.ey-s.y):0).toFixed(2)} m | replans ${s.replans} | collisions ${s.col}<br>t ${s.t.toFixed(1)} s | driven ${s.pl.toFixed(1)} m`;
+ const L=$('log');while(lgN<s.log.length){const d=document.createElement('div');d.textContent=s.log[lgN++];L.appendChild(d);L.scrollTop=L.scrollHeight}}
+function loop(now){const dm=Math.min(100,now-last);last=now;
+ if(run&&!S.done){acc+=dm*spd/100;let n=0;while(acc>=1&&n++<8){step(S);acc--;if(S.done)break}}
+ if(S.done&&run){run=false;$('go').textContent='Start'}
+ if(now-lastD>80){lastD=now;bev(S);cam(S);ui(S)}
+ requestAnimationFrame(loop)}
+requestAnimationFrame(loop);
+</script></body></html>
